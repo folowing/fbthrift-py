@@ -110,12 +110,12 @@ public:
     callback_(obj);
   }
 
-  void setCallback(std::function<void(object)>&& callback) {
+  void setCallback(folly::Function<void(object)>&& callback) {
     callback_ = std::move(callback);
   }
 
 private:
-  std::function<void(object)> callback_;
+  folly::Function<void(object)> callback_;
 };
 
 class CppServerEventHandler : public TServerEventHandler {
@@ -223,27 +223,27 @@ public:
       req->sendReply(std::unique_ptr<folly::IOBuf>());
     }
     auto preq = req.get();
-    auto buf_mw = folly::makeMoveWrapper(std::move(buf));
     try {
       tm->add(
           std::make_shared<apache::thrift::PriorityEventTask>(
             // Task priority isn't supported in Python yet.
             apache::thrift::concurrency::NORMAL,
-            [=]() mutable {
-              auto req_mw = folly::makeMoveWrapper(
-                  std::unique_ptr<ResponseChannel::Request>(preq));
+            [=, buf = std::move(buf)]() mutable {
+              auto req_up = std::unique_ptr<ResponseChannel::Request>(preq);
 
               SCOPE_EXIT {
-                eb->runInEventBaseThread([req_mw]() mutable {
-                    delete req_mw->release();
-                });
+                eb->runInEventBaseThread(
+                  [req_up = std::move(req_up)]() mutable {
+                    req_up = {};
+                  }
+                );
               };
 
-              if (!oneway && !(*req_mw)->isActive()) {
+              if (!oneway && !req_up->isActive()) {
                 return;
               }
 
-              folly::ByteRange input_range = (*buf_mw)->coalesce();
+              folly::ByteRange input_range = buf->coalesce();
               auto input_data = const_cast<unsigned char*>(input_range.data());
               auto clientType = context->getHeader()->getClientType();
               if (clientType == THRIFT_HEADER_SASL_CLIENT_TYPE) {
@@ -273,11 +273,13 @@ public:
                 auto cb_ctor = adapter_->attr("CALLBACK_WRAPPER");
                 object callbackWrapper = cb_ctor();
                 extract<CallbackWrapper&>(callbackWrapper)().setCallback(
-                    [oneway, req_mw, context, eb] (object output) mutable {
+                    [oneway, req_up = std::move(req_up), context, eb]
+                    (object output) mutable {
                   // Make sure the request is deleted in evb.
                   SCOPE_EXIT {
-                    eb->runInEventBaseThread([req_mw]() mutable {
-                      delete req_mw->release();
+                    eb->runInEventBaseThread([req_up = std::move(req_up)]
+                    () mutable {
+                      req_up = {};
                     });
                   };
 
@@ -311,19 +313,20 @@ public:
                           "method is not string or bytes");
                     }
 
-                    if (!(*req_mw)->isActive()) {
+                    if (!req_up->isActive()) {
                       return;
                     }
-                    auto q_mw = folly::makeMoveWrapper(THeader::transform(
+                    auto q = THeader::transform(
                           std::move(outbuf),
                           context->getHeader()->getWriteTransforms(),
-                          context->getHeader()->getMinCompressBytes()));
-                    eb->runInEventBaseThread([req_mw, q_mw]() mutable {
-                        (*req_mw)->sendReply(q_mw.move());
+                          context->getHeader()->getMinCompressBytes());
+                    eb->runInEventBaseThread(
+                      [req_up = std::move(req_up), q = std::move(q)]() mutable {
+                        req_up->sendReply(std::move(q));
                     });
                   } catch (const std::exception& e) {
                     if (!oneway) {
-                      (*req_mw)->sendErrorWrapped(
+                      req_up->sendErrorWrapped(
                           folly::make_exception_wrapper<TApplicationException>(
                             folly::to<std::string>(
                                 "Failed to read response from Python:",
@@ -445,42 +448,6 @@ public:
     // called.
 
     getServeEventBase()->loopForever();
-  }
-
-  object validateCppSSLConfig(object sslConfig) {
-    auto certPath = getStringAttrSafe(sslConfig, "cert_path");
-    auto keyPath = getStringAttrSafe(sslConfig, "key_path");
-    if (certPath.empty() ^ keyPath.empty()) {
-      std::string err = "cert_path and key_path must both be populated or " \
-        "both be empty.";
-      return boost::python::make_tuple(false, err);
-    }
-    auto dummyContext = std::make_shared<SSLContext>();
-    if (!certPath.empty()) {
-      try {
-        dummyContext->loadPrivateKey(keyPath.c_str());
-        dummyContext->loadCertificate(certPath.c_str());
-      } catch (const std::exception& ex) {
-        std::string err
-          = folly::to<std::string>("failed to load key ", keyPath,
-                                   " or cert ", certPath, " with exception: ",
-                                   ex.what());
-        return boost::python::make_tuple(false, err);
-      }
-    }
-    auto clientCaFile = getStringAttrSafe(sslConfig, "client_ca_path");
-    if (!clientCaFile.empty()) {
-      try {
-        dummyContext->loadTrustedCertificates(clientCaFile.c_str());
-      } catch (std::exception& ex) {
-        std::string err
-          = folly::to<std::string>("failed to load client ca file ",
-                                   clientCaFile, " with exception: ",
-                                   ex.what());
-        return boost::python::make_tuple(false, err);
-      }
-    }
-    return boost::python::make_tuple(true, object());
   }
 
   void setCppSSLConfig(object sslConfig) {
@@ -629,7 +596,7 @@ BOOST_PYTHON_MODULE(CppServerWrapper) {
     .def("getLocalAddress", &CppContextData::getLocalAddress)
     ;
 
-  class_<CallbackWrapper>("CallbackWrapper")
+  class_<CallbackWrapper, boost::noncopyable>("CallbackWrapper")
     .def("call", &CallbackWrapper::call)
     ;
 
@@ -651,7 +618,6 @@ BOOST_PYTHON_MODULE(CppServerWrapper) {
     .def("setCppSSLCacheOptions", &CppServerWrapper::setCppSSLCacheOptions)
     .def("setCppFastOpenOptions", &CppServerWrapper::setCppFastOpenOptions)
     .def("getCppTicketSeeds", &CppServerWrapper::getCppTicketSeeds)
-    .def("validateCppSSLConfig", &CppServerWrapper::validateCppSSLConfig)
 
     // methods directly passed to the C++ impl
     .def("setup", &CppServerWrapper::setup)
