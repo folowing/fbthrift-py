@@ -22,6 +22,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import signal
 import collections
 import logging
 import multiprocessing
@@ -87,11 +88,10 @@ class TGeventServer(TServer):
     def serve_forever(self):
         if self.postForkCallback:
             self.postForkCallback()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         while True:
             try:
                 self.server.serve_forever()
-            except (KeyboardInterrupt, SystemExit):
-                return 0
             except Exception as x:
                 logging.exception(x)
 
@@ -110,14 +110,18 @@ class TGeventServer(TServer):
             self.server.init_socket()
 
         print('Starting %s workers' % self.numWorkers)
-        for i in range(self.numWorkers - 1):  # Current process also serves
-            p = Process(target=self.serve_forever)
-            self.workers.append(p)
-            p.start()
+        for i in range(self.numWorkers):
+            worker = Process(target=self.serve_forever)
+            worker.start()
+            self.workers.append(worker)
 
-        self.serve_forever()
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        for worker in self.workers:
+            worker.join()
 
-    def stop(self):
+    def stop(self, *args, **kwargs):
         for worker in self.workers:
             worker.terminate()
-        self.server.stop()
+            worker.join()
+
